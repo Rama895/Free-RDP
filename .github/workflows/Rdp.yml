@@ -1,0 +1,99 @@
+name: Windows RDP via Tailscale
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  rdp:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Aktifkan RDP dan atur password
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+            throw "Secret RDP_PASSWORD belum diatur."
+          }
+
+          # Atur password akun runner tanpa mencetaknya ke log.
+          $password = ConvertTo-SecureString `
+            $env:RDP_PASSWORD -AsPlainText -Force
+
+          Set-LocalUser -Name "runneradmin" -Password $password
+
+          # Aktifkan Remote Desktop.
+          Set-ItemProperty `
+            -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" `
+            -Name "fDenyTSConnections" `
+            -Value 0
+
+          # Tetap aktifkan Network Level Authentication (NLA).
+          Set-ItemProperty `
+            -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
+            -Name "UserAuthentication" `
+            -Value 1
+
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+
+          # Izinkan koneksi inbound port 3389 dari subnet Tailscale
+          New-NetFirewallRule -DisplayName "Allow RDP Tailscale" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 3389 -RemoteAddress "100.64.0.0/10" -ErrorAction SilentlyContinue
+
+          Start-Service -Name "TermService"
+
+          Write-Host "RDP diaktifkan dan password runneradmin diperbarui."
+
+      - name: Sambungkan ke Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+
+      - name: Tampilkan alamat RDP
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          # Cari lokasi executable tailscale.exe
+          $tsCmd = Get-Command tailscale -ErrorAction SilentlyContinue
+          if ($tsCmd) {
+            $tsPath = $tsCmd.Source
+          } else {
+            $tsPath = "C:\Program Files\Tailscale\tailscale.exe"
+          }
+
+          # Dapatkan alamat IP IPv4 Tailscale
+          $ip = (& $tsPath ip -4).Trim()
+
+          Write-Host ""
+          Write-Host "=== ALAMAT RDP TAILSCALE ==="
+          Write-Host "Computer : $ip"
+          Write-Host "Username : runneradmin"
+
+      - name: Tunggu hingga dihentikan atau batas waktu tercapai
+        run: |
+          # Sisakan waktu untuk proses setup sebelum timeout job.
+          $totalMinutes = 330
+          $timer = [System.Diagnostics.Stopwatch]::StartNew()
+
+          Write-Host "Menunggu hingga $totalMinutes menit."
+          Write-Host "Buat C:\stop.txt untuk menghentikan sesi lebih awal."
+
+          while ($timer.Elapsed.TotalMinutes -lt $totalMinutes) {
+            if (Test-Path "C:\stop.txt") {
+              Write-Host "File stop ditemukan. Mengakhiri job."
+              break
+            }
+
+            Start-Sleep -Seconds 30
+          }
+
+          Write-Host "Waktu tunggu selesai."
+          
